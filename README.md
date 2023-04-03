@@ -254,3 +254,161 @@ implement our system by creating independent components and letting them live in
 requires some code duplication). Later, we may begin to see some common patterns between those components, and
 abstraction may emerge. That might be the proper time to remove duplication by creating some abstraction instead of
 starting from it.
+
+## Chapter 3: Handling errors
+
+The code can fail in a variety of ways. The code should be **fault-tolerant** whenever possible. Tackling any possible
+error explicitly in the code makes it unmaintainable, however.
+
+Not every error should be recovered from. **Let it crash** philosophy states it is better not to recover from critical
+failures. If an Out Of Memory error crashes the app - the supervisor simply restarts it. This allows not to bother with
+the OOM error handling in the code.
+
+### Exceptions
+
+The Java Exception hierarchy is as follows:
+
+`Object` => `Throwable` (class)
+
+`Throwable` => `Error` (`OutOfMemoryError`, `StackOverflowError`) - a critical problem, often should not be handled
+directly.
+
+`Throwable` => `Exception` (signal problems in the code)
+
+`Exception` => `Checked` (`IOException`, `InterruptedException`) - the compiler forces you to explicitly handle these.
+Use these when there is a way to recover.
+
+`Exception` => `Unchecked` (`IllegalArgumentException`, `NullPointerException`) - the compiler does not require explicit
+handling. Often it is better to fail fast than to try and recover.
+
+Some languages have unchecked exceptions only. Be careful to not propagate the thrown exception to the main application
+thread as it might crash the application.
+
+#### Catch all vs granular handling
+
+Let's consider a `throwingMethod` that throws two checked exceptions:
+
+```java
+public class Throwing {
+  public void throwingMethod() throws FileAlreadyExistsException, InterruptedException {
+    // throwing logic
+  }
+}
+```
+
+Here are ways to handle this:
+
+```java
+public class NormalGranularity {
+  public void demo() {
+    try {
+      new Throwing().throwingMethod();
+    } catch (FileAlreadyExistsException e) {
+      log.error("File already exists", e);
+    } catch (InterruptedException e) {
+      log.error("Interrupted", e);
+    }
+  }
+}
+```
+
+Two `catch` blocks allow providing separate exception handling paths.
+
+Benefits:
+
+- code is readable and provides the necessary details
+- each exception type is handled in a different way
+
+We could catch all exceptions:
+
+```java
+public class CatchAll {
+  public void demo() {
+    try {
+      new Throwing().throwingMethod();
+    } catch (Exception e) {
+      log.error("Problem ", e);
+    }
+  }
+}
+```
+
+Benefits:
+
+- if the intended behavior is to handle ANY exceptions and proceed further
+
+Disadvantages:
+
+- unintended exceptions can be caught
+- no granular information about exception types is present at compile time
+
+We could handle different exceptions in the same way but still explicitly describe them to the user:
+
+```java
+public class MultiCatch {
+  public void demo() {
+    try {
+      new Throwing().throwingMethod();
+    } catch (IOException | InterruptedException e) {
+      log.error("Problem ", e);
+    }
+  }
+}
+```
+
+#### Checked vs unchecked exceptions handling in a public API
+
+Annotating method APIs with exceptions clearly states the reasons for method failures and allows to choose the handling
+strategy at compile time. If an exception is not declared by the method - the caller might not know about it and the app
+would fail at runtime unexpectedly. Declaring exceptions as a part of the method's API is verbose, however. Checked
+exceptions force the method caller to use the try-catch blocks. It is possible, however, to wrap the method throwing a
+checked exception into a wrapper throwing an unchecked exception.
+
+Advantages of declaring checked exceptions as the part of the method API:
+
+- explicit contract that allows the callers to reason about the method behavior without looking at implementation
+- no surprise failures at runtime
+
+When writing both called and caller code on your own it is reasonable to use unchecked exceptions as you will not have
+surprises.
+
+When creating a public API that is called by the code unknown to you - using the checked exceptions is reasonable to
+clearly state API behavior.
+
+#### Exception handling anti-patterns
+
+##### Swallowing an exception
+
+The swallowed exception never propagates up, risking silent failure of the system. You can log the error and proceed at
+least.
+
+```java
+public class Swallow {
+  void demo() {
+    try {
+      throwingMethod();
+    } catch (Exception ignored) {
+      // do nothing
+    }
+  }
+}
+```
+
+##### Printing the stack trace to the standard output
+
+The exception content should be logged or written to the file. If it is written to the standard output we risk to lose
+the exception details.
+
+#### Exceptions from third-party libraries
+
+Avoid tight coupling with the third-party library and do not propagate the library-specific exceptions across the
+codebase. Define a custom domain exception or wrap the throwing code into a custom wrapper that handles the thrown
+exceptions. In the future, if the library change is not backward compatible, the codebase is minimally impacted.
+
+#### Performance considerations
+
+Exceptions are objects that contain a stack trace. Constructing and throwing/catching exceptions is a relatively slow
+operation. Getting a stack trace is a considerably slower operation. Logging exceptions is a much slower operation since
+the stack trace is transformed into a string.
+
+If performance is critical consider avoiding examining the stack trace and especially logging it.
