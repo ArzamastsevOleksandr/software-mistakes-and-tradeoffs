@@ -412,3 +412,42 @@ operation. Getting a stack trace is a considerably slower operation. Logging exc
 the stack trace is transformed into a string.
 
 If performance is critical consider avoiding examining the stack trace and especially logging it.
+
+## Chapter 4: Balancing flexibility and complexity
+
+> The higher flexibility your API has, the more code/execution model complexity you will introduce.
+
+When designing a public API it is better to start small and add based on the end user's input rather than implementing
+a lot of features upfront. Removing the features once they are exposed to the public is difficult.
+
+When deciding which features to retain or remove
+the [A/B testing](https://www.optimizely.com/optimization-glossary/ab-testing/) can be conducted.
+
+When designing a library for the internal organization usage we need to oversee the required list of features. If not
+much was predicted and the API is not extensible - we end up changing the library API often. If everything is accounted
+for in advance - the library might be too complicated and over engineered.
+
+Often the engineers develop the initial code with many design patterns enabling the component extensibility in the
+future - this risks introducing many abstraction levels adding complexity to the system.
+
+> A rule of thumb: start simple and improve gradually once the requirements get clearer.
+
+When designing a library try to avoid the tight coupling with other third-party library components. Instead, expose the
+generic interfaces and allow the clients to provide the implementations. This increases the library flexibility, but it
+also increases the burden on the client side. A reasonable solution would be to provide a default implementation in the
+library and allow the clients to override it. Abstracting everything, however, is not an option as some third-party
+dependencies are too complex and have many moving parts.
+
+If we try to foresee the exact use case, we might introduce fairly generic patterns, such as **listeners** or **hooks APIs**. 
+
+When using a *hooks API*, you need to guard against unpredictable usage - your code should expect any exception. You need
+to consider the thread execution model of your API extension points. If your design allows synchronous client calls,
+assume that some clients will block these, impacting the SLA of your component and resource usage (threads). But
+introducing asynchronous logic working in parallel in your code adds complexity. You need to maintain a dedicated thread
+pool and monitor it. Even if you make your processing parallel, you cannot reduce the additional latency to zero. 
+
+The *listener API* is similar to the hooks API, but it does not involve blocking between phases of your component's
+execution. The signals you emit are asynchronous and should not impact your component's latency. You need to be careful
+about the state emitted to a caller component that you do not own and assert that the state is immutable.
+
+
