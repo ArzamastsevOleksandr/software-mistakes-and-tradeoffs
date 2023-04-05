@@ -450,4 +450,85 @@ The *listener API* is similar to the hooks API, but it does not involve blocking
 execution. The signals you emit are asynchronous and should not impact your component's latency. You need to be careful
 about the state emitted to a caller component that you do not own and assert that the state is immutable.
 
+## Chapter 5: Premature optimization vs optimizing the hot path
 
+For a lot of use cases **premature optimization is evil**.
+
+> **SLA** helps manage customer expectations, and it specifies:
+>
+> * amount of traffic the service should handle
+>
+> * number of requests it needs to execute with a latency lower than a specific threshold
+
+The **hot path** is the code that does most of the work and is executed for the majority of user requests.
+
+By having enough data, rational decisions can be made allowing us to make non-negligible performance improvements
+before the system goes live. The data should come from performance benchmarks executed before the application is
+deployed to production. Expected traffic can be modeled when an SLA and the real production traffic expectations of the
+system are defined. When we *have enough data* that backs up our experiments and hypotheses, *optimization is no longer
+premature*.
+
+### When premature optimization is evil
+
+- expected traffic data is absent
+- code is optimized based on false assumptions
+
+Code optimization often leads to increased complexity. Sometimes performance needs to be traded over maintainability and
+complexity.
+
+### Optimizing hot paths
+
+Example: there are `process-request (PR)` and `modify-schema (MS)` endpoints and the `N` times each endpoint is called
+is based on the empirical data/SLA of the service. `PR` is called 10000/s with a latency of 200ms/request. `MS` is
+called 10/s with a latency of 500ms/request. Which of these should we optimize first? Based on the req/s data we can
+calculate the following:
+
+* reducing the `PR` latency by 20ms (10%) gives us the overall latency reduction of `10000 * (200ms - 180ms) = 200000ms`
+  .
+
+* reducing the `MS` latency by 250ms (50%) gives us the overall latency reduction: `10 * (500ms - 250ms) = 2500ms`.
+
+Conclusion: optimizing the `PR` endpoint leads to **80 times** more savings than optimizing the `MS` endpoint.
+
+> Optimizing the **hot path** is crucial for the overall application performance.
+
+Another way to decide which path to optimize is to calculate the total latency weight: the `MS` weight is `10 * 500 /
+(10000 * 200 + 10 * 500) = 0.24%`, while the `PR` weight is `99.76%`.
+
+**Conclusion**: optimize the `PR` first.
+
+#### Pareto principle in the context of software
+
+A small fraction of code delivers a substantial proportion of the value produced by the software (~80% of the value and
+work that our system performs is delivered by only ~20% of the code).
+
+If linear behavior is true, every path in the code has the same importance. Adding a new component to the system means
+that the value delivered to the clients increases proportionally. In reality, every system has a core functionality that
+provides the most value for the core business. The rest of the functionalities are not crucial and do not produce much
+value (say, 20%), but they require 80% of the time and effort to build. The numbers are different for every system, but
+the conclusion is:
+
+> Optimizing a smaller part of the codebase might impact most of the clients.
+
+When creating a new system try to define the SLA requirements with expected upper bounds of traffic that the system can
+handle. Once those numbers are in place, create performance tests that simulate real-world traffic.
+
+#### Configuring the number of concurrent users (threads) for a given SLA
+
+Let's aim for the service that handles `10000 req/s` with an average latency of `50ms`. `1 thread` can
+serve `1000 / 50 = 20` requests. The amount of threads required to handle such a load is `10000 / 20 = 500` given that a
+single thread on average handles `20 req/sec`. `500` threads are required by the test tool to saturate the
+system/network with traffic.
+
+#### Final thoughts
+
+Critical code paths can be measured for the number of invocations and the time it takes to execute the path. With those
+numbers, we can detect the hot path and calculate performance gains from optimizing a small part of the code. Most of
+the systems follow the Pareto principle, so optimizing the hot path, impacts and delivers improvements to the majority
+of the clients.
+
+#### A side note
+
+A Linux command to get 100 random words from a file:
+
+> sort -R words.txt | head -n 100 > result.txt
