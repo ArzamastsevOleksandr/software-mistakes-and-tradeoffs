@@ -532,3 +532,21 @@ of the clients.
 A Linux command to get 100 random words from a file:
 
 > sort -R words.txt | head -n 100 > result.txt
+
+## Chapter 6: Simplicity vs cost of maintenance
+
+> Encapsulating the downstream component settings from the clients allows evolving the APIs in a backward compatible
+> way.
+
+The configuration mechanism of our system is an entry point that exposed to the clients.
+
+We can abstract away every downstream component (any element used by the system for which we are creating a UX) and
+not expose any of those component settings directly with the tool that interacts with the user. This will improve the UX
+of our system, but it will require substantial maintenance.
+
+On the other side of the spectrum, we can directly expose all dependent settings. This option does not require much
+maintenance from us, but such an approach has a couple of tradeoffs. First, we are tightly coupling our clients with the
+downstream component used by our service or tool. This makes it hard to change the component. Additionally, handling
+changes to the downstream component in a UX-friendly (and backward compatible) way will be difficult if not impossible.
+
+todo: reiterate on this chapter
