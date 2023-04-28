@@ -550,3 +550,301 @@ downstream component used by our service or tool. This makes it hard to change t
 changes to the downstream component in a UX-friendly (and backward compatible) way will be difficult if not impossible.
 
 todo: reiterate on this chapter
+
+## Chapter 9: Libraries you use become your code
+
+When an existing third-party library is chosen and used it in the codebase, we take full responsibility for this piece of
+software that we did not develop.
+
+Some libraries/frameworks, such as [Spring](https://spring.io/),
+favor [convention over configuration](https://docs.spring.io/spring-framework/docs/3.0.0.M3/reference/html/ch16s10.html)
+. This pattern allows to start using a library right away without any necessary configuration. It trades off explicit
+settings for the UX simplicity. Be aware of this tradeoff and its limitations. The prototyping/experimentation is easier
+when using software components that do not require a configuration upfront. 
+
+> **Framework** and **library** concepts are often used interchangeably.
+>
+> A **framework** provides a *skeleton* for building the app, but the actual logic is implemented in the app itself.
+>
+> A **library** already implements *some* logic, and it is *only* called from the client code.
+
+### Beware of the defaults
+
+Let’s consider a scenario of using a third-party library responsible for HTTP calls, an [OkHttp](https://square.github.io/okhttp/), for example. 
+
+```java
+class Demo {
+  void demo() throws IOException {
+    Request request = new Request.Builder().url("http://localhost:9999").build();
+    OkHttpClient client = new OkHttpClient.Builder().build();
+    Call call = client.newCall(request);
+    Response response = call.execute();
+  }
+}
+```
+
+The HTTP client is created as a *builder* with no explicit settings. The code is simple, but should not be used in
+production like this. In the context of HTTP clients, *timeouts* are essential and *impact the performance and SLA* of
+the app. If the service SLA is 100 ms, and the call to other services is made to fulfill the request, the other call
+must complete faster than the service SLA. Choosing a proper timeout is important.
+
+High timeouts are dangerous in the microservices architecture. One microservice may need to call multiple others. Others
+may need to call the following microservices and so on. When one of the services hangs on the request processing, it may
+cause *cascading failure* to other services. The higher the timeout is, the longer it may take to process a single
+request, then there is a higher probability of cascading failure.
+
+The code that needs to fulfill the request within *100 ms* will call this endpoint and might break the service SLA.
+Instead of seeing a response in *100 ms* (success/failure), the clients are blocked for *10000 ms*. The thread that
+executes these requests may be blocked for that long. One thread that is supposed to execute *~100 requests* (*10000 ms ÷
+100 ms*) will be blocked and will not serve any other request for that amount of time, impacting the overall performance
+of the service. This problem may not appear if only one thread waits too long. However, we will start noticing
+performance issues if all or the majority of allocated threads are blocked for too long.
+
+The default timeout settings cause this issue. The client should fail the request if it needs to wait for more than the
+service SLA (*100 ms*). If the request fails, the client can retry it instead of waiting for *5000 ms* for any response.
+The read timeout of the [OkHTTP](http://mng.bz/9KP7) is 10 seconds by default!
+
+> Checking the defaults is **important**. 
+> 
+> In a real system, the timeouts must be configured according to the service SLA.
+
+
+> When importing any third-party library be aware of its settings. 
+> **Implicit** settings are OK for **prototyping**. **Explicit** settings are must-haves for **production systems**.
+
+### Concurrency models and scalability
+
+Let's imagine that the third-party library synchronous function is executed from a synchronous client code. The
+execution flow is simple: `methodA` starts => `blocking function` is called => `methodA` resumes.
+
+**What if `methodA` is asynchronous?** Every request is put into a queue. For example, when the web server needs to
+process an HTTP request, the worker thread that accepts the request does not do the actual processing. It puts the data
+into the queue which is then processed by a dedicated thread from the thread pool. When executing method calls from the
+non-blocking code, be careful about calling the code you do not own since everything is executed within the same worker
+thread. The async flow accepts the data and can do some preprocessing such as deserializing it from bytes. Next, it puts
+the data information into a queue. This operation must be fast and nonblocking to not stall the processing of incoming
+requests. We must know the execution of the code being called.
+
+#### Using async and sync APIs
+
+```java
+// A blocking third-party API
+interface EntityService {
+  Entity load();
+
+  void save(Entity entity);
+}
+```
+
+It is hard to use this blocking API from within the non-blocking code you own. The app threading model may not allow any
+blocking (Vert.x) as well. The easiest way is to *create a non-blocking wrapper around the blocking code*. The wrapper
+may return promises that will be fulfilled in the future.
+
+```java
+class AsyncWrapper {
+  final EntityService entityService;
+  final ThreadPoolExecutor executor;
+
+  AsyncWrapper(EntityService entityService) {
+    this.entityService = entityService;
+    executor = new ThreadPoolExecutor(1, 10, 100, TimeUnit.SECONDS, new LinkedBlockingDeque<>(100));
+  }
+
+  public CompletableFuture<Entity> load() {
+    return CompletableFuture.supplyAsync(entityService::load, executor);
+  }
+
+  public CompletableFuture<Void> save(Entity entity) {
+    return CompletableFuture.runAsync(() -> entityService.save(entity), executor);
+  }
+}
+```
+
+Let's analyze the code above: 
+* async actions are executed in a separate thread
+* a separate thread pool is used for thread execution
+* the thread pool requires monitoring and fine-tuning (number of threads, queue)
+
+If the library is blocking, its performance may be worse than if the library were async. **Wrapping the blocking code
+may only postpone the scalability problem.**
+
+> Async codebase is often more complicated than the synchronous one. If not used right, the async code might perform
+> worse. For async code to work well all system parts often need to be async. The system is as strong as its weakest
+> link.
+
+```java
+// Async third-party API
+public interface EntityServiceAsync {
+  CompletableFuture<Entity> load();
+
+  CompletableFuture<Void> save(Entity entity);
+}
+```
+
+All methods of this component are returning a promise meaning that the internals of the library are written in an async
+way. We do not need to implement a sync => async translation layer. The thread pool used by the `EntityServiceAsync` is
+encapsulated within the library. It may be already fine-tuned for the majority of use cases. **However, be aware of the
+defaults.** The code is called from the client app. The underlying threads still occupy resources in the app. 
+
+> It is easier to call async code from the blocking code than the other way around. 
+
+> It is often more reasonable to pick the async version of the library over the blocking one. Even if your application
+> flow is blocking today, you might convert it to async processing in the future for scalability/performance reasons. If
+> you are already using an async library, it will be easier to migrate to the new flow. However, if you are using a
+> blocking library, the migration will not be as simple. This will require a translation layer and thread pool
+> management.
+> Moreover, the code that was not written as an async call in the first place is often implemented differently.
+
+
+#### Distributed scalability
+
+> It is important to understand the third-party library scalability when using it in a distributed context.
+
+Example: we need a library that provides scheduling capabilities. It needs to:
+* run the task when a time threshold is met
+* store the tasks in a persistence layer 
+* update the task status upon its execution
+
+Implementing this set of features for a single-node environment is straightforward. Integration
+tests may validate the behavior of the scheduling library with the embedded database. 
+
+The app using this library can be deployed to multiple nodes. The same task should not be processed by more than one
+node. The state of jobs needs to be globally synchronized or partitioned to preserve system consistency. 
+
+If the scheduling library is not implemented in a scalable way, all nodes will contend for the job record in the
+database. The correctness of the changes could be achieved via using transitions or a global lock on a specific record
+which may impact the performance. **This problem can be addressed if the scheduling library supports partitioning.** The
+first node could be responsible for tasks in a given minute range, the other node for a different time period, and so
+on. 
+
+> When picking a library to be executed in a distributed environment, analyze it carefully to determine whether it will
+> behave correctly.
+
+Understanding the scalability model and knowing if it requires a global state allows to scale the app more easily. If
+the library is not designed to work in a distributed environment, we are risking scalability and correctness problems.
+Such problems often appear when the app is deployed to N nodes, where N is a higher than usual number of nodes. It often
+happens when there is a surge in traffic related to a high business opportunity for the product. It often happens during
+holidays. **This is not a time when we want to learn that the app relies on a library that does not scale.**
+
+### Testability
+
+> When picking a third-party library always have limited trust in it. Assume nothing.
+
+The best form of validating a third-party library is via testing. We often cannot change the library code, however.  
+
+When testing a component from our codebase, and the code does not allow us to impact some behavior, this is relatively
+easy to change. If our code initializes an internal component without giving the caller the possibility to inject the
+fake/mock value, the code can be refactored. When we use a third-party library, impacting the codebase may be hard or
+not feasible. Even if we submit the change, the time from change to deployment can be substantial. 
+
+> Before choosing a third-party library, validate its testability.
+
+#### Testing library
+
+Almost every third-party library has some internal state. If the library allows us to inject a different implementation,
+that is a significant advantage.
+
+Example: if the caching library is used it might evict the caches after some expiration period. Writing a test for
+this behaviour would involve sleeping for specific amounts of time during the test execution. Test execution
+becomes too slow. If the library provides the ability to inject the timers that handle the expiration periods - the
+testability of such a library is greatly simplified since we can advance the internal timers easily without sleeping.
+
+### Dependencies of third-party libraries
+
+Every library or framework is written by engineers who may need to make a similar decision: **should we implement a
+small part of the logic ourselves or use another library that provides that functionality?** When we import a library
+that provides an HTTP client functionality, it should not rely on yet another library providing the same functionality.
+The situation is different when engineers who create a library are not working on its core functionality. For example,
+the HTTP client library may provide an out-of-the box JSON serialization/deserialization capabilities. Designers of the
+HTTP client library may choose to use other third-party libraries to provide the JSON related functionality. It is a
+reasonable decision, but it creates a couple of problems for the client app. Every class that is shipped with the HTTP
+client (including their dependencies) will be visible to the client code, so we can use the JSON processing library via
+transitive dependency. However, tight coupling is introduced between the app code and the library. The HTTP client
+library may change the JSON processing library in the future, and the client code will break.
+
+#### Semantic versioning and compatibility
+
+Most libraries have adopted semantic versioning with a version string consisting of three parts: major, minor, and
+patch. Any breaking change should be indicated by a change to the major part of the version string. The impact here is
+that if the complete set of dependencies only uses the same major version for the JSON library, we should be able to
+just use the latest of those versions everywhere. If there are multiple major versions involved, we need them to be
+effectively independent dependencies.
+
+#### Too many dependencies +
+
+> Every library you import impacts your application.
+
+Be aware that libraries use other libraries to provide non-core functionality. Examine the number of dependencies it
+brings. There is a big difference between importing other libraries for hard-to-write, complex functionality and for
+simple tasks that can be implemented easily from scratch. It is often not feasible for library creators to
+perform shading for all dependencies, as it requires too much time and effort.
+
+Every dependency imported into your app influences the target **fat jar** size. Seriously take into account the number
+of dependencies your app has. The fewer the dependencies there are, the smaller the app will be, the faster it will
+start, and also, it will be easier to deploy and manage. The runtime overhead will be lower because the built
+application needs to be loaded in the machine's RAM that runs it.
+
+> A **fat jar** is a self-contained application runnable with all required dependencies that can be easily run without
+> external dependencies.
+
+In the Java ecosystem, the [Maven-shade-plugin](https://maven.apache.org/plugins/maven-shade-plugin/) simplifies the
+build process of the fat jar and provides a way to perform shading using the renaming technique. 
+
+#### Reusing code +
+
+If only a small part of the library functionality is required - consider copying that part to your code directly, add the tests for it, and take full ownership of the code. 
+But now you need to be responsible for its bug fixes.
+
+Forking the original library and develop needed functionalities is also an option but comes with maintenance problems as
+you need to keep the fork up to date to include the bug fixes from the original codebase. Also, both code versions may
+diverge, making it hard to keep them consistent.
+
+#### Vendor lock-in +
+
+Software gets deprecated. When using a library or service be aware there may be a need to migrate to a new solution in
+the future. Try hiding the integration points behind an abstraction layer if you know that this probability is high.
+When there is a need to switch the implementation, the change will not propagate to a lot of places in the code.
+Instead, it will be encapsulated within the abstraction, and a code change will be needed only there.
+
+When starting with a new library, observe how it impacts the app and architecture. The more invasive the integration is,
+the harder it will be to change the vendor in the future. It is hard to hide every possible library and service
+integration point behind abstraction in the real world. Some level of vendor lock-in is also hard to alleviate, but
+strive to minimize it by picking libraries that do not require tight coupling with the app.
+
+#### Library vs framework +
+
+Often, we can abstract the library away easily. All calls to the HTTP service library can be hidden in the custom
+wrapper. Later we can switch a library for another implementation without a considerable cost. We can also decide to
+implement it ourselves and remove the dependency on this library.
+
+Frameworks are invasive and require using their constructs throughout the app. The more framework imports are in the
+codebase, the more tightly coupled they are. It is more difficult to change the framework to something else during the
+lifecycle of the app compared to a library. 
+
+#### Security and updates +
+
+Ideally, we should perform security tests before deploying a new release of the app. Third-party dependencies evolve and
+might contain new security vulnerabilities. If such is found, often a new version of the library is published with the
+fix. We should upgrade the library ASAP. The longer we wait, the more time there is for the potential attacker to
+exploit that vulnerability.
+
+How can we find out if the third-party dependency had a security problem:
+* check for [security vulnerabilities](https://www.cvedetails.com/)
+* [automate security checks](https://dependabot.com/) that scan all third-party libraries and notify us when there is a problem
+
+#### Decision checklist
+
+Before using a third-party library consider the following:
+
+| Parameter                                       | Question                                                                                                                                                               |
+|-------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Configurability and defaults                    | Can we provide (and override) all critical settings?                                                                                                                   |
+| Concurrency model, scalability, and performance | Does it provide an async API if our applications workflow is async as well?                                                                                            |
+| Distributed context                             | Can it be safely run in a distributed context?                                                                                                                         |
+| Investigating reliability                       | Are we choosing a framework or a library?                                                                                                                              |
+| Testing                                         | How hard it is to test the code that uses this library? Does the library provide its own testing toolkit?                                                              |
+| Dependencies                                    | What does the library depend on? Is it self-contained and isolated? Or does it download a lot of external dependencies, impacting the size and complexity of your app? |
+| Versioning                                      | Does the library follow semantic versioning? Is it evolving in a backward-compatible way?                                                                              |
+| Maintenance                                     | Is it popular and actively maintained?                                                                                                                                 |
+| Integration                                     | How invasive is the integration with this library? How much do we risk being locked into a single vendor?                                                              |
+| Security and updates                            | Is it frequently upgrading the downstream components to address their security vulnerabilities?                                                                        |
