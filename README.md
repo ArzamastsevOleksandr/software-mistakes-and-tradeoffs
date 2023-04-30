@@ -848,3 +848,405 @@ Before using a third-party library consider the following:
 | Maintenance                                     | Is it popular and actively maintained?                                                                                                                                 |
 | Integration                                     | How invasive is the integration with this library? How much do we risk being locked into a single vendor?                                                              |
 | Security and updates                            | Is it frequently upgrading the downstream components to address their security vulnerabilities?                                                                        |
+
+## Chapter 10: Consistency and atomicity in distributed systems
+
+If we want our application to scale and run in a distributed environment, we need to design our code for that. Having a
+consistent view of the system is important and relatively easy to achieve if our application is deployed to one node and
+uses a standard database that works in a primary–secondary architecture. In such a context, a database transaction
+guarantees the atomicity of our operations. However, in reality, our applications need to be scalable and elastic.
+Depending on our traffic patterns, we want to be able to deploy our services to N nodes. Once we deploy the application
+to N nodes, we may notice scalability problems on the lower layer - the database. In such a case, there is often a need to
+migrate the data layer to a distributed database. By doing so, we are able to distribute the incoming traffic handling
+to N microservices, which, in turn, distribute the traffic to M database nodes. In such an environment, our code needs
+to be designed in an entirely different way.
+
+### At-least-once delivery of data sources
+
+Even if the service has a straightforward deployment model and is not designed for scalability, it probably will operate
+in a distributed environment, there is a high probability it needs to call a different service, and every time that
+happens - a network call is performed. This means our service needs to execute a request that reaches out via the
+network and waits for the response.
+
+#### Traffic between one-node services
+
+Imagine that an Order application is deployed to one node and needs to perform a call to a Mail service. When the Mail
+service receives the request, it sends an email to the end user.
+
+Remember that every network request can fail. The failure can be caused by an error from the service we are calling.
+
+It is not simple to reason about errors from the caller's perspective. The Mail service's failure may
+happen after or before it sends an email. If there is a failure when sending an email, and the Mail service is able to
+respond reasonably (with a status code denoting the nature of the error), Order app can conclude that the email was
+not sent. But if Order app gets a generic error without reason, we cannot safely assume that the mail was not already
+delivered.
+
+Consider a network failure: there could be a situation in which we call the Mail service, which results in a
+successfully sent email. The mail service responds to Order app with a successful status. Remember that the request and
+response are sent via a network, and every network call can fail for an arbitrary number of reasons. For example, some
+routers, switches, or hubs that are on the network path may break. There could also be a network partition preventing
+the package delivery.
+
+When there is a network failure, the caller cannot reason about the outcome of the request. Order app will observe a
+timeout and end up in an inconsistent state: it does not have a complete view of the system. The mail may or may not
+have been sent.
+
+#### Retrying an application's call
+
+When Order app does not receive a successful response, it may retry the initial request. If the retry succeeds - the
+caller app has a mostly consistent view of the system again. However, retries may be problematic. We might need to retry
+more than once, and there is a chance that the Mail service will send more than one duplicated email. Consider a
+situation in which the first request fails, then the retry fails, and the request is retried again - there is a
+possibility that the given email will be sent up to three times! The reason for this is that we do not know if the
+previous call (before the retries) failed before or after the mail was sent. At the first stage of processing, Order app
+sends a request to the Mail service. Next, the mail service successfully sends the email. After it sends the email, it
+returns a response to the caller. However, during the response, there is a network partition. From Order app's
+perspective, this will be observed as a failure. The caller app does not get the response and fails with the timeout. If
+the caller decides to retry, it will call the Mail service again. From the Mail service's perspective, the retry is just
+another request that needs to be handled, so it sends the same email again. This time, the response is delivered to the
+Order app successfully, so there is no retry. However, the email was sent twice.
+
+In real-world architectures we may need to integrate with many external services. Retries for sending email may not be
+problematic. We may have more significant problems if our system needs to make a payment. Making a payment is also an
+external call, and retrying a payment is problematic because we may debit the user's account more than once. When we
+retry an operation to the Mail service, it will offer an **at-least-once delivery** semantically. If Order app retries
+the operation until it succeeds, the mail will be delivered *once or more*. There could be a duplicated delivery, but
+there is no way that there will be no delivery at all.
+
+#### Producing data and idempotency
+
+Retrying an operation that has side effects is often not safe. But how do we decide if a retry operation is safe? The idempotency characteristic of the system answers this question. An
+operation is **idempotent** if it results in the same outcome regardless of the number of invocations.
+Getting information from a DB is idempotent (assuming that the underlying data has not changed between
+attempts). **Get**ting the data from an HTTP endpoint should also be idempotent. If our
+service needs to retrieve data from a different service, it may retry the get operation multiple times. This is assuming
+that none of the get operation executions modify any state. It is safe to get the value, retrying as many times as
+needed. Deleting the record for a given ID is idempotent. If we remove an entry with a specific ID and retry it, that is idempotent. Let's assume
+the entry was removed by the first operation. If there is a retry of removing an element that was already removed, it
+does nothing. 
+
+On the other hand, producing data is most often a non-idempotent operation. Sending mail is not idempotent. When we
+issue a send operation, the mail is sent, and this is a side effect
+that cannot be rolled back. Retrying such an operation results in another send, so this is yet another side effect.
+
+Producing actions *can be idempotent*. Imagine we have a cart service that sends the events
+with the user's products status on an e-commerce site. Events are consumed by other services interested in
+the cart state. One approach is to send an event denoting that a product was added to a cart each
+time an item is added. If the user adds a new book to a cart, a new event with quantity one is sent.
+Next, the users add the same book to the cart again, so another quantity of one is sent.
+The book event's consumer service builds its own view of the cart's state, based on the sent events. 
+
+> Such an *event-based* architecture is often used to build a system that follows the **command query responsibility
+> segregation (CQRS)** pattern. This allows independent scaling of the writes and the read parts of our system. For our
+> scenario, the events from the cart service are sent to some queue, and multiple independent consumer services can
+> consume those events. Every service can build its database model optimizing it for its read traffic. Moreover, adding
+> more read-side services does not impact the write performance of cart service. 
+
+The problem with the presented business model is that it is *not idempotent*. If the cart service needs to retry the send
+for any cart event, there will be a duplicate state delivered to the book events consumer service. Because the consumer
+service needs to recreate the cart view based on events, it will increment the quantity of the item in the cart in case
+of one duplicated event. The resulting quantity will be equal to 3. The view will then be inconsistent and broken. Such a business model is non-idempotent. **How can we rework it to be idempotent?**
+Instead of sending an event with every modification, the cart service can send an event with a full view of its cart.
+Every time the new item is added to a user's cart, the new aggregated event is produced. The first time the user adds book A to a cart, the event with quantity one is sent. The
+second time book A is added, a new event will contain a quantity equal to two. All cart event consumer
+services will get the full view of the cart and will not need to recreate the local view that can become
+inconsistent in case of retry. The cart service can now retry send of such an event without the danger of introducing an
+inconsistent state.
+
+There is one more caveat: in the case of a retry, the cart service can still emit a
+duplicate. Because the cart's full state is propagated, the more recent event sent to the customers can override the
+older cart state for the user. In the case of a retry, the ordering of events may get mixed. It is possible that the
+first event is delayed or its order is mixed so that it overrides the second event leading to the system inconsistency.
+
+Be careful when doing retries for the same user. This problem can be solved by ordering the events at the customer side
+or ordering the event's send at the cart service side. We should also not mix the ordering by retries.
+Usually, we don't need to have a global ordering of events: the cart is created and owned by a specific user. Every user
+has a unique ID. Therefore, we can propagate the user_id of the user to which the cart belongs. By having that
+information, we only need to order events for this specific ID. If the cart events are ordered within a user_id, the
+services that consume events can recreate the cart per user_id without worrying about overriding behavior. We can say
+that cart data is partitioned by user_id, and that ordering is guaranteed within a partition. The queue frameworks
+often provide a way to achieve an order within a partition.
+
+Propagating the full state of a view also has some drawbacks. If the state gets bigger, we need to transfer more data
+over the network every time the event is sent. Serialization and deserialization logic will need
+to perform more work. However, in a real systems, the idempotency of such a business model often justifies those
+tradeoffs.
+
+#### Command Query Responsibility Segregation
+
+Imagine we need to build two services that consume users' cart data. The existing cart
+service is responsible for writing the user's event to a persistent queue. This is the writing model commands (C) of our
+architecture. We may have N services consuming the users' events asynchronously. Imagine we have two services: a user 
+profile service and a relational analysis service.
+The user profile service needs to optimize its read model for faster data retrieval via the user_id. We may pick
+some distributed database and use the user_id as a partition key. The customers of the user profile can then query
+the service via user_id, using the read-optimized data model. The relational analysis service data model is
+optimized for totally different use cases. It also reads the users' data, but it builds a different read model optimized
+for offline analysis, and it allows different query patterns optimized for batch queries. It may save
+those events to a distributed file system, such as HDFS. Both user profile and relational analysis services are the
+Query (Q) part of our CQRS architecture.
+
+This architecture gives us a couple essential benefits. First, the data producers and consumers are decoupled from each
+other. Second, the service that produces the events does not need to guess all possible future uses for its data. It
+saves the events in the data store that is optimized for writing. The consumer's responsibility is to fetch this data
+and transform it into its database model optimized for the specific use case. Teams developing consuming services can
+work independently, creating a business value based on the commonly available data. When using CQRS, the data is a
+first-class citizen. Consumer services can consume different sources of data and use them for their own purposes.
+
+However, this pattern has a lot of drawbacks. First, the data will be duplicated in N places. The more read model
+services we need, the more duplication there will be. Also, this architecture requires a lot of data movement. There
+will be many requests sent from both write model services (to save the initial data) and read model services. Any of
+those requests can fail, so all the problems discussed previously (retries, at-least-once-delivery, network
+partition, and idempotency of operation) will influence the state of our system. The more services we have, the more 
+things may go wrong. An out-of-sync state can occur between reading model
+services if we are not guarding against such problems properly. One non-idempotent duplicate sent to one of the two
+services can make the state of the whole system diverge.
+How do we design a fault-tolerant system (meaning that it retries the failed actions) that works in a distributed
+environment (in reality, this is almost every production system) and assure ourselves that we have a consistent view
+of the system? The well-proven pattern for this is a deduplication logic implemented on the consumer side. When a
+service that performs a non-idempotent action (one that cannot be retried) implements deduplication logic, it
+effectively changes its behavior to be idempotent for all callers. 
+
+### A naive implementation of a deduplication library
+
+Let's try to make the mail service send out idempotent. This can be achieved by implementing a deduplication logic in
+the mail service. When a new request arrives at this service, it checks if it was delivered before. If the request was
+not delivered, it means that it's not a duplicate, and it can safely process the request.
+
+Every event needs to have a unique identifier to make deduplication work. The caller
+service (application A) will generate the UUID that uniquely identifies each request. When the request is sent again,
+the same UUID is used. By using this information, the mail service, which receives an event, can validate whether it was
+received previously. If we have an architecture where a request (or event) can travel through multiple services, all of
+those services can use the same unique ID of that request. Usually, the unique ID is generated at the producer side and 
+can be used for deduplication along the way by multiple services. The information about whether the ID was processed 
+must be persistent.
+
+Let’s consider the same situation that caused mail duplicates. The first request with ID 1234 is sent. When the request 
+arrives at the mail service, it first checks if the request with the
+given ID was processed. If there was not a processed event with the given
+ID, it adds that record to the database. Then, it continues processing by sending the mail to the end user. Next, the
+mail service sends information that the data was correctly processed, and unfortunately, the network
+partition happens.
+Application A does not know if the mail was sent or not, so it retries the request with the same ID. When the retried
+request arrives at the mail service, it checks whether it is a duplicate. If the request was already processed, it does
+not process this request.
+The solution looks robust, but it has one problem. What happens if there is a failure after the mail service saves the
+ID of processed request information but before actually sending the mail? 
+
+If deduplication service checks and saves the ID of the event before the sending, we are risking a partial
+failure. It is possible that after the request is marked as processed, the mail sent process fails. A response with
+failure will be sent to the caller application. The caller application will retry as expected with the same request id.
+However, the mail service has the given ID marked as already processed, and the request will not be processed,
+and the mail will not be sent. The most straightforward approach for implementing this would be to split the 
+deduplication service into two stages and to insert the mail send action between those stages.
+First, the new approach will try to get the record from a database for a given ID. When the ID is not present, it should
+execute any action provided by the caller - the mail sent action. Once the send finishes
+successfully, we can insert a new record with the request id.
+
+```java
+public class NaiveDeduplicationService {
+  private final DbClient dbClient = new DbClient();
+
+  public void executeIfNotDuplicate(String id, Runnable action) {
+    boolean present = dbClient.find(id);
+    if (!present) {
+      action.run(); // blocks send actions for some time
+      dbClient.save(id);
+    }
+  }
+}
+```
+
+The provided solution seems to behave properly for both failure scenarios we are discussing. When there is a network
+partition after the successful mail send, the request id is already persisted in the database (it is after the
+dbClient.save() method call). In this case, retrying requests will be caught as a duplication.
+The second scenario we are considering (when there is a failure during the mail send) will fail the Runnable processing.
+This will, in turn, cause no save of request-id to the database. When retrying the request, it will be properly
+reprocessed because the request id is not saved.
+
+However, we need to remember that our mail service operates in a distributed environment. Because this is an inherently
+concurrent environment, the discussed solution will not provide idempotency for all use cases. Let’s consider why the
+solution is not atomic and how we can do it in an atomic way.
+
+### Common mistakes when implementing deduplication in distributed systems
+
+#### One node context
+
+Let's see how the deduplication logic performs in the context of Order service and mail service deployed to one node.
+
+Let's analyze a retry for a given ID. The first call executed by Order app is executed at time T1. We will assume that 
+it fails, and the retry is executed after it fails at time T2. Again, we will assume there is a happens-previously 
+relationship before the first request and the retry action. In this case, our deduplication logic is not atomic. It is 
+split into three stages:
+
+* stage 1: search for the request-id in the DB
+* stage 2: execute the mail service logic if the request-id is not found
+* stage 3: save the request-id in the DB
+
+For simplicity, let's consider the only failure at stage 2, but in a real-world application, the failure can happen at 
+any stage. This makes it more tricky and complex to analyze. Our analysis focuses on the main functionality of this 
+component: preventing duplicate email sends.
+
+If the first request (T1) fails at stage 2, the response is returned to the caller's app. Because request fails at stage
+2, the stage 3 action is not executed. The retry at T2 will be executed, and the mail send action succeeds. There is no 
+possibility for a duplicate send in that case, even if the `executeIfNotDuplicate` method is not atomic.
+
+Let's consider what happens if the email send action executes for a long time. The email send action is blocking, and it 
+involves another remote call (sending an actual email). This call can block the processing of the code. It can also fail
+during the response because of the network partition.
+
+Every network request should have configured a reasonable timeout to prevent the blocking of threads and resources. 
+Let's assume that Order app defines the timeout of 10 sec, but the mail service send blocks for 20 sec. The request at 
+T1 fails after 10 seconds. However, it does not mean that the mail send fails. It may succeed but only 10 sec later. 
+
+Both requests will interleave. From the perspective of Order app, the first request at T1 times out. However, the main 
+action is blocked for 20 sec, and after that time, it will succeed. Next, the application will save its request-id to a 
+DB. In the meantime, Order app retries the request at T2 because it observed a failure. The retried request will arrive 
+at a mail service before it saves its request-id from T1 as an already-processed request. Due to that fact, T2 is 
+treated as a new, non-duplicated request. This causes an email to be sent. In the meantime, the request at T1 completes
+and also causes the mail to be sent. Because the duplicate was sent, the nonatomic deduplication service causes an 
+inconsistency in the system.
+
+This is only one of the failure scenarios that can cause a duplicate in the one node context. However, when designing a 
+robust component, even one use case where the requirements are broken should be enough to consider changing a design. 
+
+#### Multiple nodes context
+
+When the mail service is deployed to multiple nodes, its API is exposed via Load Balancer. Every service is reachable
+via its IP address. New mail service instances can be added
+or removed, depending on the traffic. Because of this, the mail service instance IPs are hidden from the Order app.
+The request executed by Order app is sent to a load balancing service. The load balancing service captures the
+request and redirects it to a specific backend for the mail service.
+The actual implementation of load balancing is abstracted away from the Order app. When the new mail service
+is deployed, it registers itself with the load balancing service. From that point, the load balancing service routes
+the traffic to the newly added node. 
+
+In this scenario, the mail service must be stateless and be able to process any arriving request. All needed
+state, including the table with the already processed request-ids, is kept in a separate DB. We will assume that the DB 
+is not distributed and keeps all its state on one node. In a real-life application, however, the scalable application 
+(which achieves that by adding or removing nodes) should probably use a distributed database, so the request-id data is
+partitioned into N nodes. This also allows the data layer to scale horizontally by adding or removing nodes. However,
+the failure scenarios we are discussing will be present when using both (distributed and non-distributed) DB types.
+
+Let’s assume our load balancer component works simply by doing a round-robin on a request to an underlying backend for
+the mail service. The first request will be routed to mail service 1, the second request to mail service 2, and so on.
+Load balancing algorithms widely use the round-robin strategy because it's simple to implement and easy to
+understand. It also tends to perform well for a lot of use cases. There are other load balancing algorithms that, for
+example, can take the latency of the nodes into account. One of the most widely used is
+the [power of two choices](http://mng.bz/DxPR) algorithm. The specific algorithm used by the load balancing service, 
+however, does not influence our analysis.
+
+Unfortunately, our current deduplication logic will not work correctly in such an environment. Let’s consider a scenario
+when application A retries a request in the multi-node context.
+
+In step 1, Order app sends the request for a mail send. The request flows through the load balancer and, in step 2,
+is routed to the first mail service backend. In step 3, the mail service checks whether the request-id is in the
+DB. It is not, so it continues processing. Unfortunately, this step results in a timeout that is returned to
+Order app in step 4. Order app issues a retry in step 5, and this retry request is routed to a second mail
+backend in step 6. In step 7, the mail service checks whether the request id was processed already. If it turns out it
+was not processed, it continues with the send. In the meantime, the first mail service backend completes the mail send
+request and, in step 8, saves the request id to a DB. Then, in step 9, the second backend finishes its execution
+and saves the request id to the DB, overriding the previous save operation that the first mailing backend issued.
+This also means that both mail service instances did not observe a duplicate when our deduplication logic started and
+resulted in a duplicate execution of logic that sends the actual email.
+
+In a real-life scenario, the situation may get even worse. Order app triggers the mail send based on some logic. It
+may turn out that the logic is triggered by yet another external call from another service. This is not uncommon in
+microservices architecture (especially event based). The business flow may span multiple services. Also, assuming that
+our applications are stateless, Order app may also receive duplicated requests. For that reason, our deduplication
+logic is not atomic and may result in more mail duplication. A consistent view of our system will be strongly impacted
+because it's possible there will be a lot of duplicates. At this point of our analysis, it is clear to see that our
+deduplication logic needs improvement. Let's next see how to make it atomic in single- and multi-node contexts.
+
+### Making your logic atomic to prevent race conditions
+
+Let's recap our current deduplication logic. We have three stages:
+
+* stage 1: search for the request-id in the DB
+* stage 2: execute the mail service logic if the request-id is found
+* stage 3: save the request-id in the DB
+
+It is worth noting that all discussed failure scenarios will break our system's consistency, regardless of whether we
+have stage 2 in our logic or not. Let's simplify our example and assume that our deduplication logic has only stage 1
+and stage 3. Our deduplication logic will look like this now:
+
+* stage 1: search for the request-id in the DB
+* stage 2: save the request-id in the DB
+
+There is still a possibility to send a duplicate email because both calls to retrieve and save the data from or to the
+DB can also fail because those are remote calls executed in a distributed system. There could also be a network
+partition when a successful response from the DB is sent via a deduplication logic. All failure scenarios that
+we discussed in the context of Order app apply to DB calls as well. For example, when calling the save
+request-id operation (stage 3), the operation may throw an exception denoting a timeout. As we know, a timeout does not
+give the caller a lot of information. There could be a situation in which the client-side timeout is triggered, but the
+operation on the server side is still executing. From Order app's perspective, this means the action fails,
+returning an error to the client. The retry may happen before the request-id is inserted into a table by service
+instance 1. Therefore, the request will be routed to the second service instance. 
+
+The find and save action can interleave, making the system inconsistent. For example, the find operation on one thread 
+can be executed after it is executed on another thread. The find operation can take an arbitrary amount of time.
+Therefore, we cannot make any strong assumptions here. For both find calls, it will return false, so the logic
+continues, and finally, a save will be called twice. Because of that, our deduplication logic does not work correctly.
+To achieve the atomicity of our deduplication logic, we need to reduce the number of stages required to only one stage.
+We also need to check whether the given request is a duplicate and save the request-id in one operation. This should be
+one external call without any intermediate steps. Every time the process needs to retrieve a value, do some action, and
+save another value, there is a potential for a race condition.
+
+This is true when executed in a multithreaded environment. We can synchronize all calls to our deduplication component,
+but that would mean this component's concurrency level is equal to one. In other words, the service processes only one
+request at a time. Such a solution is unusable in real-life applications that need to handle N requests per second. The
+more requests the system needs to handle, the higher the contention and number of threads will be. This increases the
+likelihood of intermediate failures that will make our deduplication logic inconsistent.
+
+Fortunately, most distributed databases that will be used the most often in a horizontally scaling architecture expose
+a way to perform our task in a single atomic operation. We need to execute a save action that inserts a new record only 
+if it is not present. Moreover, it needs to return a Boolean, denoting if the insert was successful or not. Such an 
+operation gives us all the information that we need to
+implement a robust deduplication logic. This is called an upsert; the save action inserts a value only if it is not
+present and returns the outcome. You need to find out if your DB of choice
+exposes such a method. Upsert should be atomic, meaning that the database should execute it as a single operation.
+Because upsert is atomic, there is no way for a race condition between two interleaving operations. All logic is
+executed at the database side, and the outcome is returned to the caller.
+
+```java
+public class UpsertDeduplicationService {
+  private final DbClient dbClient = new DbClient();
+
+  public boolean isNew(String id) {
+    return dbClient.findAndInsertIfNeeded(id);
+  }
+}
+```
+
+When `findAndInsertIfNeeded` returns `true`, it denotes that the given ID was inserted in the DB. This means that it
+was not previously present there. What is important is that this method will insert the given ID into the DB. We
+don't need to implement stage 2, which was needed before. When the method `findAndInsertIfNeeded` returns `false`, the
+ID is a duplicate. It also means the upsert didn't insert a new ID because the value was already present.
+Our logic is atomic now and, therefore, is not prone to a race condition. We need to note that using an atomic operation
+that both inserts and checks if a value is present does not allow us to execute a custom action between those stages.
+However, we saw that such an approach was faulty. Currently, the deduplication logic is responsible only for finding
+duplicates. It does not try to assure that the request was successfully executed in an end-to-end fashion. The new
+deduplication logic has one functionality, and it performs that in an atomic and correct way. When using this new
+deduplication component in the mail service without another mechanism that checks the correctness of sending mail, we
+are risking a chance that mail will not be delivered. Let's consider a situation where the deduplication logic marks
+the request as processed at the time when the request arrives at the mail system. If the failure of processing happens
+after that, the application request retry does not take effect because this request is marked as already processed.
+On the other hand, if the duplicate is marked after successful processing, there is no mechanism preventing duplicate
+send again. Due to that fact, we should use atomic deduplication at the entry to a system. However, we should use it
+with other mechanisms that verify the system’s correctness, such as transaction logs or rollback (removal) of the
+processed ID in case of a failure. All of those techniques have their complexities and tradeoffs and should be analyzed
+separately.
+
+Executing and reasoning about the actions in a distributed
+system is challenging and complex. If you can design your processing to be idempotent, your system will be more
+fault-tolerant and robust. However, not every processing service can be idempotent, and we need to design a mechanism
+that guards our system against retrying an action that should not be retryable. If you don't want to design a complex
+deduplication logic, every request failure will be critical from your application's perspective because you are not able
+to retry. Only manual action by the system administrator can reconcile the data. This is not ideal if you want to make
+your system fault-tolerant and reliable.
+
+For that reason, we may decide to implement mechanisms, such as deduplication with retries, to address those problems.
+However, we need to be careful because implementing such mechanisms in a distributed system may generate different
+characteristics than what we expected. Implementing a system that is supposed to be consistent but works differently
+is dangerous. We may risk introducing hard-to-debug errors and losing money when executing duplicate transactions. For
+those reasons, we should analyze all incoming and outgoing traffic in the context of correctness and delivery semantics.
